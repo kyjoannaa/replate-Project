@@ -105,6 +105,6 @@ def dietary_and_capacity_matching_node(state: AgentState) -> AgentState:
         "eligible_shelters": eligible,
         "matched_shelter": best_match,
         "match_score": best_match["calculated_score"],
-        "status": "matched",
+        "status": "Matched",
         "log_messages": logs
     }

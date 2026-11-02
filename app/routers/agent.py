@@ -24,12 +24,12 @@ def run_agent_matching(listing_id: str):
         result = negotiation_agent.invoke(initial_state)
 
         # Jika berhasil match, update status listing di Supabase
-        if result["status"] == "matched" and result["matched_shelter"]:
+        if result["status"].lower() == "matched" and result["matched_shelter"]:
             matched_shelter_id = result["matched_shelter"]["beneficiary_id"]
             
             # Update status di DB
             supabase.table("food_surplus_listings") \
-                .update({"status": "matched"}) \
+                .update({"status": "Matched"}) \
                 .eq("id", listing_id) \
                 .execute()
                 
