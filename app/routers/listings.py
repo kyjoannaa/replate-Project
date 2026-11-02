@@ -5,7 +5,7 @@ from app.db import supabase
 router = APIRouter(prefix="/api/listings", tags=["Food Surplus Listings"])
 
 @router.get("/")
-async def get_all_listings():
+def get_all_listings():
     """Fetch all surplus food listings from Supabase."""
     try:
         response = supabase.table("food_surplus_listings").select("*").execute()
