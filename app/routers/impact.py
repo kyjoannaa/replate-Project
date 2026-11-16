@@ -1,7 +1,8 @@
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Depends, status
 from pydantic import BaseModel
 from typing import Optional
 from app.db import supabase
+from app.dependencies.auth import require_role
 
 router = APIRouter(prefix="/api/impact", tags=["Impact Logs"])
 
@@ -11,7 +12,10 @@ class ImpactLogCreate(BaseModel):
     carbon_offset_kg: Optional[float] = None
 
 @router.post("/", status_code=status.HTTP_201_CREATED)
-async def create_impact_log(impact: ImpactLogCreate):
+async def create_impact_log(
+    impact: ImpactLogCreate,
+    current_user: dict = Depends(require_role("Courier", "Beneficiary"))
+    ):
     """Log the environmental impact of a completed delivery."""
     try:
         impact_data = impact.dict()
