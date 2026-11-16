@@ -110,9 +110,13 @@ def dietary_and_capacity_matching_node(state: AgentState) -> AgentState:
         return state
 
     category = food_item.get("category", "").lower()
+    food_title = food_item.get("food_title", "").lower()
     portions_available = food_item.get("portion_count", 0)
     
-    is_food_halal = "halal" in category or "protein" in category or "bakery" in category or "fruit" in category
+    # Cek apakah mengandung unsur non-halal secara eksplisit terlebih dahulu
+    is_explicitly_non_halal = any(word in category or word in food_title for word in ["non-halal", "non halal", "babi", "pork", "lard", "bacon"])
+    
+    is_food_halal = not is_explicitly_non_halal and ("halal" in category or "protein" in category or "bakery" in category or "fruit" in category)
     is_food_veggie = "veggie" in category or "vegetarian" in category or "fruit" in category
 
     eligible = []
