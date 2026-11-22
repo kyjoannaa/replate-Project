@@ -22,6 +22,7 @@ app.include_router(listings.router)
 app.include_router(beneficiaries.router)
 app.include_router(agent.router)
 app.include_router(users.router)
+app.include_router(users.auth_router)
 app.include_router(deliveries.router)
 app.include_router(impact.router)
 
