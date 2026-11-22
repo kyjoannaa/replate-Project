@@ -1,12 +1,28 @@
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
-from typing import Literal, Optional
+from pydantic import BaseModel, ConfigDict
+from typing import Optional
 from app.db import supabase
 from app.dependencies.auth import get_current_user
 
 router = APIRouter(prefix="/api/users", tags=["Users"])
+auth_router = APIRouter(prefix="/api/auth", tags=["Auth"])
 
 ALLOWED_ROLES = ("Donor", "Beneficiary", "Courier")
+
+
+def normalize_role(raw_role: str) -> str:
+    """Normalize frontend role values/labels into 'Donor', 'Beneficiary', or 'Courier'."""
+    val = (raw_role or "").strip().lower()
+    if "donor" in val or "hotel" in val or "fnb" in val:
+        return "Donor"
+    if "beneficiary" in val or "yayasan" in val or "panti" in val or "shelter" in val:
+        return "Beneficiary"
+    if "courier" in val or "kurir" in val or "driver" in val:
+        return "Courier"
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=f"user_role tidak valid: '{raw_role}'. Harus salah satu dari: {', '.join(ALLOWED_ROLES)}"
+    )
 
 
 class UserCreate(BaseModel):
@@ -17,43 +33,59 @@ class UserCreate(BaseModel):
 
 
 class UserSignUp(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     email: str
     password: str
-    full_name: str
+    full_name: Optional[str] = None
+    name: Optional[str] = None
     phone: Optional[str] = None
-    user_role: Literal["Donor", "Beneficiary", "Courier"]
+    user_role: Optional[str] = None
+    role: Optional[str] = None
     organization_name: Optional[str] = None
+    organization: Optional[str] = None
+    org_name: Optional[str] = None
     address: Optional[str] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
 
 
 class UserLogin(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     email: str
     password: str
 
 
 class UserProfileUpdate(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     organization_name: Optional[str] = None
     address: Optional[str] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
 
 
-# --- AUTHENTICATION ENDPOINTS (SIGN UP & LOGIN) ---
+# --- AUTHENTICATION ENDPOINTS (/api/users & /api/auth) ---
 
 @router.post("/signup", status_code=status.HTTP_201_CREATED)
+@auth_router.post("/signup", status_code=status.HTTP_201_CREATED)
 def signup_user(payload: UserSignUp):
     """Register user in Supabase Auth, save role to public.users, and initialize user_profiles."""
     try:
+        resolved_name = (payload.full_name or payload.name or payload.email.split("@")[0]).strip()
+        resolved_role = payload.user_role or payload.role or ""
+        resolved_org = payload.organization_name or payload.organization or payload.org_name
+        canonical_role = normalize_role(resolved_role)
+
         # 1. Daftarkan akun ke Supabase Auth
         auth_res = supabase.auth.sign_up({
             "email": payload.email,
             "password": payload.password,
             "options": {
                 "data": {
-                    "full_name": payload.full_name,
-                    "user_role": payload.user_role
+                    "full_name": resolved_name,
+                    "user_role": canonical_role
                 }
             }
         })
@@ -71,14 +103,13 @@ def signup_user(payload: UserSignUp):
             "id": auth_user_id,
             "email": payload.email,
             "phone": payload.phone,
-            "full_name": payload.full_name,
-            "user_role": payload.user_role
+            "full_name": resolved_name,
+            "user_role": canonical_role
         }
 
         try:
             res_db = supabase.table("users").insert(user_record).execute()
         except Exception:
-            # Fallback jika kolom id di tabel users di-generate otomatis oleh DB
             user_record.pop("id", None)
             res_db = supabase.table("users").insert(user_record).execute()
 
@@ -87,11 +118,11 @@ def signup_user(payload: UserSignUp):
 
         # 3. Buat row awal di user_profiles jika info organisasi/lokasi diisi
         created_profile = None
-        if any([payload.organization_name, payload.address, payload.latitude, payload.longitude]):
+        if any([resolved_org, payload.address, payload.latitude, payload.longitude]):
             try:
                 profile_payload = {
                     "user_id": db_user_id,
-                    "organization_name": payload.organization_name or payload.full_name,
+                    "organization_name": resolved_org or resolved_name,
                     "address": payload.address,
                     "latitude": payload.latitude,
                     "longitude": payload.longitude
@@ -105,9 +136,12 @@ def signup_user(payload: UserSignUp):
 
         return {
             "status": "success",
-            "message": f"Registrasi berhasil sebagai {payload.user_role}!",
+            "message": f"Registrasi berhasil sebagai {canonical_role}!",
             "access_token": access_token,
             "token_type": "bearer" if access_token else None,
+            "role": canonical_role,
+            "user": created_user,
+            "profile": created_profile,
             "data": {
                 "user": created_user,
                 "profile": created_profile
@@ -120,6 +154,7 @@ def signup_user(payload: UserSignUp):
 
 
 @router.post("/login")
+@auth_router.post("/login")
 def login_user(credentials: UserLogin):
     """Authenticate user via Supabase Auth and return JWT access_token, role, and profile."""
     try:
@@ -134,11 +169,9 @@ def login_user(credentials: UserLogin):
                 detail="Email atau password salah."
             )
 
-        # Ambil data akun & role dari public.users
         res_user = supabase.table("users").select("*").eq("email", credentials.email).execute()
         user_account = res_user.data[0] if res_user.data else None
 
-        # Ambil data profil organisasi dari user_profiles jika ada
         user_profile = None
         if user_account and user_account.get("id"):
             res_prof = supabase.table("user_profiles").select("*").eq("user_id", user_account["id"]).execute()
@@ -170,12 +203,9 @@ def login_user(credentials: UserLogin):
 async def create_user(user: UserCreate):
     """Register a new user directly in public.users."""
     try:
-        if user.user_role not in ALLOWED_ROLES:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"user_role harus salah satu dari: {', '.join(ALLOWED_ROLES)}"
-            )
+        canonical_role = normalize_role(user.user_role)
         user_data = user.dict()
+        user_data["user_role"] = canonical_role
         response = supabase.table("users").insert(user_data).execute()
 
         return {
@@ -198,7 +228,7 @@ def get_all_users(
     try:
         query = supabase.table("users").select("*")
         if user_role:
-            query = query.eq("user_role", user_role)
+            query = query.eq("user_role", normalize_role(user_role))
         res_users = query.execute()
 
         res_profiles = supabase.table("user_profiles").select("*").execute()
