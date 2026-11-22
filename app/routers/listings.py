@@ -1,11 +1,10 @@
 import inspect
 from datetime import datetime, date
 from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel
 from app.db import supabase
 from app.routers.agent import execute_agent_orchestration
-from app.dependencies.auth import require_role
 
 router = APIRouter(prefix="/api/listings", tags=["Food Surplus Listings"])
 
@@ -56,12 +55,21 @@ def _enrich_listings(listings: list) -> list:
 
 
 @router.post("/", status_code=status.HTTP_201_CREATED)
-async def create_food_listing(
-    listing: FoodListingCreate,
-    current_user: dict = Depends(require_role("Donor"))
-):
+async def create_food_listing(listing: FoodListingCreate):
     """Add a new food surplus listing and trigger LangGraph matching."""
     try:
+        donor_check = (
+            supabase.table("user_profiles")
+            .select("id, role")
+            .eq("id", listing.donor_id)
+            .execute()
+        )
+        if not donor_check.data or donor_check.data[0].get("role") != "Donor":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only registered Donor accounts can post food listings."
+            )
+
         listing_data = {
             "donor_id": listing.donor_id,
             "food_title": listing.food_title,
@@ -98,6 +106,8 @@ async def create_food_listing(
             "agent_matching": agent_result
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

@@ -1,5 +1,5 @@
 from fastapi import APIRouter
-from app.core.supabase import supabase
+from app.db import supabase
 from app.agents.nodes import run_matching_workflow
 
 router = APIRouter()
