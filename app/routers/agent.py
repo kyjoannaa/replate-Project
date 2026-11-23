@@ -1,4 +1,5 @@
 import random
+from typing import Optional
 from fastapi import APIRouter, HTTPException
 from app.agents.graph import negotiation_agent
 from app.db import supabase
@@ -9,6 +10,23 @@ router = APIRouter(prefix="/api/agent", tags=["Agentic AI Negotiation Engine"])
 
 def _generate_unique_pin() -> str:
     return f"{random.randint(1000, 9999)}"
+
+
+def _resolve_beneficiary_user_id(profile_or_user_id: Optional[str]) -> Optional[str]:
+    if not profile_or_user_id:
+        return None
+    try:
+        res = (
+            supabase.table("user_profiles")
+            .select("id, user_id")
+            .eq("id", profile_or_user_id)
+            .execute()
+        )
+        if res.data and res.data[0].get("user_id"):
+            return res.data[0]["user_id"]
+    except Exception:
+        pass
+    return profile_or_user_id
 
 
 def execute_agent_orchestration(listing_id: str) -> dict:
@@ -28,22 +46,26 @@ def execute_agent_orchestration(listing_id: str) -> dict:
     is_matched = str(result.get("status", "")).lower() == "matched" and bool(result.get("matched_shelter"))
     matched_shelter = result.get("matched_shelter") or {}
     matched_shelter_id = matched_shelter.get("beneficiary_id")
+    matched_shelter_user_id = matched_shelter.get("user_id") or _resolve_beneficiary_user_id(matched_shelter_id)
     matched_shelter_name = matched_shelter.get("organization_name", "Panti Penerima")
     match_pin = _generate_unique_pin() if is_matched else None
 
     negotiation_id = None
-    try:
-        res_log = supabase.table("agent_negotiation_logs").insert({
-            "listing_id": listing_id,
-            "beneficiary_id": matched_shelter_id,
-            "status": "Matched" if is_matched else result.get("status", "no_match_found"),
-            "match_score": result.get("match_score", 0.0),
-            "decision_logs": result.get("log_messages", [])
-        }).execute()
-        if res_log.data:
-            negotiation_id = res_log.data[0].get("id")
-    except Exception as log_err:
-        print(f"[WARNING] Gagal insert ke agent_negotiation_logs: {log_err}")
+    for ben_fk in (matched_shelter_id, matched_shelter_user_id):
+        if negotiation_id is not None:
+            break
+        try:
+            res_log = supabase.table("agent_negotiation_logs").insert({
+                "listing_id": listing_id,
+                "beneficiary_id": ben_fk,
+                "status": "Matched" if is_matched else result.get("status", "no_match_found"),
+                "match_score": result.get("match_score", 0.0),
+                "decision_logs": result.get("log_messages", [])
+            }).execute()
+            if res_log.data:
+                negotiation_id = res_log.data[0].get("id")
+        except Exception as log_err:
+            print(f"[WARNING] Gagal insert ke agent_negotiation_logs ({ben_fk}): {log_err}")
 
     if is_matched:
         supabase.table("food_surplus_listings").update({
@@ -56,19 +78,18 @@ def execute_agent_orchestration(listing_id: str) -> dict:
         eta = matched_shelter.get("estimated_eta_hours", 0.0)
         route_poly = matched_shelter.get("route_polyline", [])
 
-        dispatch_data = None
-        try:
-            pickup_addr = (
-                result["food_item"].get("address")
-                or result["food_item"].get("organization_name", "Hotel Donor")
-                if result.get("food_item")
-                else "Hotel Donor"
-            )
-            delivery_addr = matched_shelter.get("address") or matched_shelter_name
-            dist_val = float(dist) if dist != "N/A" else 0.0
-            eta_mins = max(1, int(round(float(eta) * 60))) if eta != "N/A" else 15
+        pickup_addr = (
+            result["food_item"].get("address")
+            or result["food_item"].get("organization_name", "Hotel Donor")
+            if result.get("food_item")
+            else "Hotel Donor"
+        )
+        delivery_addr = matched_shelter.get("address") or matched_shelter_name
+        dist_val = float(dist) if dist != "N/A" else 0.0
+        eta_mins = max(1, int(round(float(eta) * 60))) if eta != "N/A" else 15
 
-            res_dispatch = supabase.table("delivery_dispatches").insert({
+        dispatch_candidates = [
+            {
                 "negotiation_id": negotiation_id,
                 "listing_id": listing_id,
                 "beneficiary_id": matched_shelter_id,
@@ -78,11 +99,49 @@ def execute_agent_orchestration(listing_id: str) -> dict:
                 "estimated_duration_mins": eta_mins,
                 "delivery_status": "Assigned",
                 "verification_pin": match_pin,
-                "route_polyline": route_poly
-            }).execute()
-            dispatch_data = res_dispatch.data[0] if res_dispatch.data else None
-        except Exception as disp_err:
-            print(f"[WARNING] Gagal insert ke delivery_dispatches: {disp_err}")
+                "route_polyline": route_poly,
+            },
+            {
+                "negotiation_id": negotiation_id,
+                "listing_id": listing_id,
+                "beneficiary_id": matched_shelter_user_id,
+                "pickup_address": pickup_addr,
+                "delivery_address": delivery_addr,
+                "estimated_distance_km": dist_val,
+                "estimated_duration_mins": eta_mins,
+                "delivery_status": "Assigned",
+                "verification_pin": match_pin,
+                "route_polyline": route_poly,
+            },
+            {
+                "negotiation_id": negotiation_id,
+                "pickup_address": pickup_addr,
+                "delivery_address": delivery_addr,
+                "estimated_distance_km": dist_val,
+                "estimated_duration_mins": eta_mins,
+                "delivery_status": "Assigned",
+                "verification_pin": match_pin,
+            },
+            {
+                "negotiation_id": negotiation_id,
+                "pickup_address": pickup_addr,
+                "delivery_address": delivery_addr,
+                "estimated_distance_km": dist_val,
+                "estimated_duration_mins": eta_mins,
+                "delivery_status": "Assigned",
+            },
+        ]
+
+        dispatch_data = None
+        for idx, candidate in enumerate(dispatch_candidates):
+            try:
+                clean_payload = {k: v for k, v in candidate.items() if v is not None or k == "negotiation_id"}
+                res_dispatch = supabase.table("delivery_dispatches").insert(clean_payload).execute()
+                if res_dispatch.data:
+                    dispatch_data = res_dispatch.data[0]
+                    break
+            except Exception as disp_err:
+                print(f"[WARNING] delivery_dispatches attempt {idx + 1} gagal: {disp_err}")
 
         try:
             send_match_notification(

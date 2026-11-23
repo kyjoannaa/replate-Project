@@ -25,11 +25,53 @@ def normalize_role(raw_role: str) -> str:
     )
 
 
+def _ensure_user_profile(
+    db_user_id: str,
+    full_name: str,
+    email: str,
+    role: str,
+    org_name: Optional[str] = None,
+    address: Optional[str] = None,
+    latitude: Optional[float] = None,
+    longitude: Optional[float] = None,
+) -> Optional[dict]:
+    """Fetches existing user_profiles row or creates one linked via user_id."""
+    res_prof = supabase.table("user_profiles").select("*").eq("user_id", db_user_id).execute()
+    if not res_prof.data:
+        res_prof = supabase.table("user_profiles").select("*").eq("id", db_user_id).execute()
+    if res_prof.data:
+        return res_prof.data[0]
+
+    base_payload = {
+        "user_id": db_user_id,
+        "organization_name": org_name or full_name,
+        "address": address or "Jakarta",
+        "latitude": latitude,
+        "longitude": longitude,
+    }
+    try:
+        created = supabase.table("user_profiles").insert(base_payload).execute()
+        return created.data[0] if created.data else base_payload
+    except Exception:
+        extended_payload = {
+            **base_payload,
+            "full_name": full_name,
+            "email": email,
+            "role": role,
+        }
+        try:
+            created = supabase.table("user_profiles").insert(extended_payload).execute()
+            return created.data[0] if created.data else extended_payload
+        except Exception as prof_err:
+            print(f"[WARNING] Gagal inisialisasi user_profiles: {prof_err}")
+            return None
+
+
 class UserCreate(BaseModel):
     email: str
     phone: Optional[str] = None
     full_name: str
-    user_role: str  # Harus: 'Donor', 'Beneficiary', atau 'Courier'
+    user_role: str
 
 
 class UserSignUp(BaseModel):
@@ -116,23 +158,32 @@ def signup_user(payload: UserSignUp):
         created_user = res_db.data[0] if res_db.data else user_record
         db_user_id = created_user.get("id", auth_user_id)
 
-        # 3. Buat row awal di user_profiles jika info organisasi/lokasi diisi
-        created_profile = None
-        if any([resolved_org, payload.address, payload.latitude, payload.longitude]):
+        # 3. Selalu pastikan row di user_profiles dibuat agar profile_id selalu tersedia
+        created_profile = _ensure_user_profile(
+            db_user_id=db_user_id,
+            full_name=resolved_name,
+            email=payload.email,
+            role=canonical_role,
+            org_name=resolved_org,
+            address=payload.address,
+            latitude=payload.latitude,
+            longitude=payload.longitude,
+        )
+
+        # Auto-create default beneficiary_constraints jika role Beneficiary
+        if canonical_role == "Beneficiary" and created_profile and created_profile.get("id"):
             try:
-                profile_payload = {
-                    "user_id": db_user_id,
-                    "organization_name": resolved_org or resolved_name,
-                    "address": payload.address,
-                    "latitude": payload.latitude,
-                    "longitude": payload.longitude
-                }
-                res_prof = supabase.table("user_profiles").insert(profile_payload).execute()
-                created_profile = res_prof.data[0] if res_prof.data else profile_payload
-            except Exception as prof_err:
-                print(f"[WARNING] Gagal inisialisasi user_profiles saat signup: {prof_err}")
+                supabase.table("beneficiary_constraints").upsert({
+                    "beneficiary_id": created_profile["id"],
+                    "requires_halal": True,
+                    "requires_vegetarian": False,
+                    "max_capacity_servings": 50,
+                }).execute()
+            except Exception:
+                pass
 
         access_token = auth_res.session.access_token if auth_res.session else None
+        profile_id = created_profile.get("id") if created_profile else db_user_id
 
         return {
             "status": "success",
@@ -140,11 +191,13 @@ def signup_user(payload: UserSignUp):
             "access_token": access_token,
             "token_type": "bearer" if access_token else None,
             "role": canonical_role,
+            "profile_id": profile_id,
             "user": created_user,
             "profile": created_profile,
             "data": {
                 "user": created_user,
-                "profile": created_profile
+                "profile": created_profile,
+                "profile_id": profile_id,
             }
         }
     except HTTPException:
@@ -174,10 +227,14 @@ def login_user(credentials: UserLogin):
 
         user_profile = None
         if user_account and user_account.get("id"):
-            res_prof = supabase.table("user_profiles").select("*").eq("user_id", user_account["id"]).execute()
-            if not res_prof.data:
-                res_prof = supabase.table("user_profiles").select("*").eq("id", user_account["id"]).execute()
-            user_profile = res_prof.data[0] if res_prof.data else None
+            user_profile = _ensure_user_profile(
+                db_user_id=user_account["id"],
+                full_name=user_account.get("full_name") or credentials.email.split("@")[0],
+                email=credentials.email,
+                role=user_account.get("user_role") or "Donor",
+            )
+
+        profile_id = user_profile.get("id") if user_profile else (user_account.get("id") if user_account else None)
 
         return {
             "status": "success",
@@ -185,6 +242,7 @@ def login_user(credentials: UserLogin):
             "access_token": auth_res.session.access_token,
             "token_type": "bearer",
             "role": user_account.get("user_role") if user_account else None,
+            "profile_id": profile_id,
             "user": user_account,
             "profile": user_profile
         }
@@ -242,7 +300,9 @@ def get_all_users(
         enriched_users = []
         for u in (res_users.data or []):
             user_copy = u.copy()
-            user_copy["profile"] = profiles_map.get(u.get("id"))
+            prof = profiles_map.get(u.get("id"))
+            user_copy["profile"] = prof
+            user_copy["profile_id"] = prof.get("id") if prof else u.get("id")
             enriched_users.append(user_copy)
 
         return {"status": "success", "data": enriched_users}
@@ -255,7 +315,7 @@ def get_user_by_id(
     user_id: str,
     current_user: dict = Depends(get_current_user)
 ):
-    """Fetch a single user account and their organization profile by user_id."""
+    """Fetch a single user account and their organization profile by user_id or profile_id."""
     try:
         res_user = supabase.table("users").select("*").eq("id", user_id).execute()
         res_prof = supabase.table("user_profiles").select("*").eq("user_id", user_id).execute()
@@ -265,11 +325,15 @@ def get_user_by_id(
         if not res_user.data and not res_prof.data:
             raise HTTPException(status_code=404, detail="User not found")
 
+        prof = res_prof.data[0] if res_prof.data else None
+        acct = res_user.data[0] if res_user.data else None
+
         return {
             "status": "success",
             "data": {
-                "account": res_user.data[0] if res_user.data else None,
-                "profile": res_prof.data[0] if res_prof.data else None
+                "account": acct,
+                "profile": prof,
+                "profile_id": prof.get("id") if prof else (acct.get("id") if acct else None),
             }
         }
     except HTTPException:
